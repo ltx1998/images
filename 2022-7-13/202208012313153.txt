@@ -1,0 +1,855 @@
+package com.swdmobile.interfaces.workflow.action;
+
+import com.sap.mw.jco.IFunctionTemplate;
+import com.sap.mw.jco.JCO;
+import com.swdbrowser.dataobject.HrmResourceDataObject;
+import com.swdbrowser.service.HrmResourceService;
+import com.swdbrowser.service.HrmResourceServiceImpl;
+import com.swdmobile.SAPUtils;
+import com.swdmobile.Utils;
+import weaver.conn.RecordSet;
+import weaver.file.Prop;
+import weaver.general.BaseBean;
+import weaver.general.Util;
+import weaver.hrm.User;
+import weaver.interfaces.workflow.action.Action;
+import weaver.soa.workflow.request.*;
+
+import java.text.SimpleDateFormat;
+import java.util.*;
+
+public class SynOrderAction extends BaseBean implements Action {
+
+    private String sellerName;
+
+    String ip = Prop.getPropValue("siwode", "ip");
+    String client = Util.null2String(getPropValue("siwode", "client"));
+    String clientNum = Util.null2String(getPropValue("siwode", "clientNum"));
+    String user = Util.null2String(getPropValue("siwode", "user"));
+    String password = Util.null2String(getPropValue("siwode", "password"));
+    //性别
+    private final Map<String, String> sexMap = new HashMap<String, String>();
+
+    private void init() {
+        sexMap.put("0", "男");
+        sexMap.put("1", "女");
+    }
+
+    private String mainTableName;
+
+    @Override
+    public String execute(RequestInfo requestinfo) {
+        List<Map<String, String>> listData = new ArrayList<>();
+        List<Map<String, String>> listDt1Data = new ArrayList<>();
+        List<Map<String, String>> listDt2Data = new ArrayList<>();
+        List<Map<String, String>> listDt4Data = new ArrayList<>();
+        Utils util = new Utils();
+
+        SAPUtils utils = new SAPUtils();
+        User usr = requestinfo.getRequestManager().getUser();//获取当前操作用户对象
+        String uid = String.valueOf(usr.getLogintype());//当前用户状态
+        String requestid = requestinfo.getRequestid();
+        String fbps = Prop.getPropValue("siwode", "fbps");//分班配饰
+        //主表map
+        Map<String, String> mainTableMap = new HashMap<>();//维护一个map存放数据
+        //取主表数据
+        Property[] properties = requestinfo.getMainTableInfo().getProperty();// 获取表单主字段信息
+        for (Property property : properties) {
+            String name = property.getName();// 主字段名称
+            String value = Util.null2String(property.getValue());// 主字段对应的值
+            mainTableMap.put(name, value);
+        }
+        String sellerId = mainTableMap.get("khjl");
+        HrmResourceService hrmResourceService = new HrmResourceServiceImpl();
+        HrmResourceDataObject seller = hrmResourceService.getUserInfoByUserId(Integer.parseInt(sellerId));
+        sellerName = seller.getName();
+        //当前节点
+        RecordSet rs = new RecordSet();
+        String sf = mainTableMap.get("sfxyqryh");
+        if (sf.equals("0") || sf.equals("2")) {//判断是否选择触发印花流程
+            long cn = 01;
+            long cnt = 01;
+            rs.execute("select count(*) as cn from formtable_main_359 where glycd='" + requestid + "'");
+            if (rs.next()) {
+                cn = Long.parseLong(rs.getString("cn"));
+            }
+            rs.execute("select count(*) as cnt from formtable_main_395 where glycd='" + requestid + "'");
+            if (rs.next()) {
+                cnt = Long.parseLong(rs.getString("cnt"));
+            }
+            if (cn == 0 && cnt == 0) {
+                requestinfo.getRequestManager().setMessagecontent("流程提交失败,请检查是否有触发子流程");
+                requestinfo.getRequestManager().setMessageid("流程提交失败,请检查是否有触发子流程");
+                return FAILURE_AND_CONTINUE;
+            }
+        }
+
+        int nodeId = requestinfo.getRequestManager().getNodeid();//获取当前节点的Id（nodeId）
+        mainTableMap.put("nodeId", String.valueOf(nodeId));
+        String VBELN = mainTableMap.get("VBELN");
+        String MATNR = "MATNR"; //物料号字段
+        String ZSUMMK = "ZSUMMK"; //物料号数量
+        String ljZSUMMK = "ljZSUMMK"; //累加物料号数量
+        String MAKTX = "MAKTX"; //明细备注
+        String ZBANJ = "ZBANJ"; //班级
+        String MVGR1 = "MVGR1"; //学段
+
+        String AUART = mainTableMap.get("AUART");//订单类型
+        String main = "";
+        String dt1 = "";
+        String dt2 = "";
+        String dt4 = "";
+
+        //新增加匹配不同流程的配送单
+        try {
+            mainTableName = requestinfo.getDetailTableInfo().getDetailTable()[0].getTableDBName().replace("_dt1", "");
+        } catch (Exception e) {
+            e.printStackTrace();
+            String errorMessage = "对不起，该接口仅适用于配送单。";
+            requestinfo.getRequestManager().setMessageid(errorMessage);
+            requestinfo.getRequestManager().setMessagecontent(errorMessage);
+            return FAILURE_AND_CONTINUE;
+        }
+
+        //增补表
+        if (AUART.equals("ZFD2")) {//赠送订单
+            main = "formtable_main_369";
+            dt1 = "formtable_main_369_dt1";
+            dt2 = "formtable_main_369_dt2";
+        } else {
+            main = mainTableName;
+            dt1 = mainTableName + "_dt1";
+            dt2 = mainTableName + "_dt2";
+            dt4 = mainTableName + "_dt4";
+        }
+        //获取主表对应的id，用于汇总明细表入库
+        rs.execute("select id from " + main + " where requestId = '" + requestid + "'");
+        if (rs.next()) {
+            mainTableMap.put("mainId", rs.getString("id"));
+        }
+
+        mainTableMap.put("uid", uid);
+        //取明细数据
+        DetailTable[] detailtable = requestinfo.getDetailTableInfo().getDetailTable();// 获取所有明细表
+
+        if (detailtable.length > 0) {
+            // 指定明细表
+            for (DetailTable dt : detailtable) {
+                String tableName = dt.getTableDBName();
+                //分班数据表
+                if (tableName.equals(dt1)) {
+                    Row[] s = dt.getRow();// 当前明细表的所有数据,按行存储
+                    for (Row row : s) {
+                        Map<String, String> cellMap = new HashMap<>();//维护一个map存放数据
+                        Cell[] c = row.getCell();// 每行数据再按列存储
+                        // 指定列
+                        for (Cell c1 : c) {
+                            String name = c1.getName();// 明细字段名称
+                            String value = c1.getValue();// 明细字段的值
+                            cellMap.put(name, value);
+                        }
+                        listData.add(cellMap);
+                    }
+                } else if (tableName.equals(dt2)) {
+                    //特码表
+                    Row[] s = dt.getRow();// 当前明细表的所有数据,按行存储
+                    for (Row row : s) {
+                        Map<String, String> cellMap = new HashMap<>();//维护一个map存放数据
+                        Cell[] c = row.getCell();// 每行数据再按列存储
+                        // 指定列
+                        for (Cell c1 : c) {
+                            String name = c1.getName();// 明细字段名称
+                            String value = c1.getValue();// 明细字段的值
+                            cellMap.put(name, value);
+                        }
+                        listDt2Data.add(cellMap);
+                    }
+                } else if (tableName.equals(dt4)) {
+                    listDt4Data = util.doGetListMap(dt);
+                }
+            }
+        }
+
+        String result;
+        Map<String, String> khMap = new HashMap<>();
+        //数据校验
+        for (Map<String, String> map : listData) {
+            String kh = map.get("MATNR").trim();
+            if (kh.isEmpty()) {
+                requestinfo.getRequestManager().setMessagecontent("流程提交失败,请检查是否有款号为空");
+                requestinfo.getRequestManager().setMessageid("流程提交失败,请检查是否有款号为空");
+                return FAILURE_AND_CONTINUE;
+            }
+            String bj = map.get("ZBANJ");//明细表1的班级
+            String xd = map.get("xh105");//MVGR1
+
+            String nj = map.get("nj");
+
+            String khbjxdnj = kh + bj + xd + nj;//加了个年级2020-4-17
+            String khbjnj = kh + bj + nj;//加了个年级2020-4-17
+
+            //2021-01-26 减去下面无语的写法。
+            if (fbps.contains(kh)) {
+                for (String key : map.keySet()) {
+                    if (key.startsWith("xh") || "th".equals(key)) {
+                        String value = map.get(key);
+                        if (!"".equals(value)) {
+                            result = "配饰不允许输入其他型号数量！请修改！";
+                            this.writeLog(result);
+                            requestinfo.getRequestManager().setMessagecontent("流程提交失败 " + result);
+                            requestinfo.getRequestManager().setMessageid("流程提交失败");
+                            return FAILURE_AND_CONTINUE;
+                        }
+                    }
+                }
+            }
+
+            if (fbps.contains(kh)) {
+                for (Map.Entry<String, String> entry : map.entrySet()) {
+                    if (entry.getKey().startsWith("xh") || "th".equals(entry.getKey())) {
+                        if (!"".equals(entry.getValue())) {
+                            result = "配饰不允许输入其他型号数量！请修改！";
+                            this.writeLog(result);
+                            requestinfo.getRequestManager().setMessagecontent("流程提交失败 " + result);
+                            requestinfo.getRequestManager().setMessageid("流程提交失败");
+                            return FAILURE_AND_CONTINUE;
+                        }
+                    }
+                }
+            }
+            // 如果班级款号学段年级存在相同，数据错误，
+            if (khMap.containsKey(khbjxdnj)) {
+                result = "分班明细中，存在款号：" + kh + "，班级：" + bj + ",学段：" + xd + "相同数据，请核对数据信息！";
+                this.writeLog(result);
+                requestinfo.getRequestManager().setMessagecontent("流程提交失败 " + result);
+                requestinfo.getRequestManager().setMessageid("流程提交失败");
+                return FAILURE_AND_CONTINUE;
+            }
+            //如果班级款号年级存在相同，数据错误，
+            if (khMap.containsKey(khbjnj)) {
+                result = "分班明细中，存在款号：" + kh + "，班级：" + bj + "相同数据，请核对数据信息！";
+                this.writeLog(result);
+                requestinfo.getRequestManager().setMessagecontent("流程提交失败 " + result);
+                requestinfo.getRequestManager().setMessageid("流程提交失败");
+                return FAILURE_AND_CONTINUE;
+            }
+            khMap.put(khbjxdnj, khbjxdnj);
+            khMap.put(khbjnj, khbjnj);
+        }
+
+        //物料号明细拼接
+        for (Map<String, String> map : listData) {
+            String value = map.get("MATNR");
+            String bj = map.get("ZBANJ");
+            String bz = map.get("bz");//备注
+            String xd = map.get("MVGR1");//学段，定价相关
+            String nj1 = map.get("nj");//年级
+            String nj = GradeZH(nj1);//将数字转为小学，中学类似的文字
+            for (Map.Entry<String, String> entryMap : map.entrySet()) {
+                Map<String, String> cellMap = new HashMap<>();//维护一个map存放数据
+                String dKey = entryMap.getKey();
+                String dValue = entryMap.getValue();
+
+                //SAP暂时不要
+//                    if (dKey.equals("MATNR")) {
+//                        value = dValue;
+//                        cellMap.put(MATNR,value);
+//                        cellMap.put(ZSUMMK,"0"); //款式 数量给对方为0
+//                        cellMap.put(MAKTX,bz); //备注
+//                        cellMap.put(ZBANJ,bj); //班级
+//                        cellMap.put(MVGR1,xd); //班级
+//                    } else
+
+                //新加了其他不是尺码的字段，一定要在这里屏蔽一下，否则会跟款号拼接起来！！！！！
+                if (!dKey.equals("MATNRZB") && !dKey.equals("sfzbdd") && !dKey.equals("MATNR") && !dKey.equals("zj") && !dKey.equals("lsj") && !dKey.equals("bz")
+                        && !dKey.equals("ZBANJ") && !dKey.equals("MVGR1") && !dKey.equals("nj") && !dValue.isEmpty()) {
+                    if (dKey.equals("th")) {
+                        dKey = "999";//特号
+                    }
+                    String MATNRVALUE = "";
+                    //配饰特殊处理
+                    if (fbps.contains(value) && dKey.equals("ps")) {
+                        MATNRVALUE = value;
+                    } else {
+                        MATNRVALUE = value + dKey;//款号拼接尺码
+                        if ("xh95".equals(dKey) || "xh90".equals(dKey)) {
+                            MATNRVALUE = MATNRVALUE.replace("xh", "0");
+                        } else {
+                            MATNRVALUE = MATNRVALUE.replace("xh", "");
+                        }
+                    }
+                    boolean exist = doCompareData(listDt1Data, xd, MATNRVALUE, dValue);
+                    if (!exist) {
+                        cellMap.put(MATNR, MATNRVALUE);
+                        cellMap.put(ZSUMMK, dValue);
+                        cellMap.put(ljZSUMMK, dValue);
+                        cellMap.put(MAKTX, bz); //备注
+                        cellMap.put(ZBANJ, nj + bj); //年级+班级，合并一个字段传到sap
+                        cellMap.put(MVGR1, xd); //学段
+                        cellMap.put("exist", "false"); //存在相同款号学段标识
+                    } else {
+                        //明细行要增加
+                        cellMap.put(MATNR, MATNRVALUE);
+                        cellMap.put(ZSUMMK, dValue);
+                        cellMap.put(MAKTX, bz); //备注
+                        cellMap.put(ZBANJ, nj + bj); //年级+班级，合并一个字段传到sap
+                        cellMap.put(MVGR1, xd); //学段
+                        cellMap.put("exist", "true"); //存在相同款号学段标识
+                    }
+                }
+                listDt1Data.add(cellMap);
+            }
+        }
+
+        //数据去空处理
+        List<Map<String, String>> listTemp = utils.removeNull(listDt1Data);
+        this.writeLog("调用SAP接口开始，参数：" + mainTableMap
+                + "分班明细：" + listTemp.toString() + "特码明细：" + listDt2Data);
+
+//        this.writeLog("步骤1");
+        try {
+//            this.writeLog("步骤2");
+            result = doPushOrderDataToSAP(mainTableMap, listTemp, listDt2Data, requestid, listDt4Data);
+        } catch (Exception e) {
+            e.printStackTrace();
+            result = "调用SAP接口异常，请核对SAP系统参数及SAP与流程字段";
+            this.writeLog(result);
+            requestinfo.getRequestManager().setMessagecontent("流程提交失败 " + result);
+            requestinfo.getRequestManager().setMessageid("流程提交失败");
+            return FAILURE_AND_CONTINUE;
+        }
+        //返回结果
+        if (result.contains("E")) {
+            this.writeLog("流程提交失败 " + result);
+            requestinfo.getRequestManager().setMessagecontent("流程提交失败 " + result);
+            requestinfo.getRequestManager().setMessageid("流程提交失败");
+            return FAILURE_AND_CONTINUE;
+        } else if (result.equals("F")) {
+            this.writeLog("流程提交失败 ,调用SAP接口失败" + result);
+            requestinfo.getRequestManager().setMessagecontent("流程提交失败 ,调用SAP接口失败");
+            requestinfo.getRequestManager().setMessageid("流程提交失败");
+            return FAILURE_AND_CONTINUE;
+        }
+        this.writeLog("调用SAP接口结束，结果：" + result);
+        return SUCCESS;
+    }
+
+    /**
+     *
+     */
+    public boolean doCompareData(List<Map<String, String>> listDt1Data, String xd, String dkey, String dvalue) {
+        for (Map<String, String> map : listDt1Data) {
+            //存在编号为空的情况，在这里做特殊处理
+            if (map.size() == 0) {
+                continue;
+            }
+            String MATNR = map.get("MATNR");
+            String xdOld = map.get("MVGR1");
+            //学段款号一样，累加
+            if (MATNR.equals(dkey) && xdOld.equals(xd)) {
+                String value = map.get("ljZSUMMK");
+                long mvgr1 = Long.parseLong(value) + Long.parseLong(dvalue);
+                map.put("ljZSUMMK", String.valueOf(mvgr1));
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public String doPushOrderDataToSAP(Map<String, String> mainTable, List<Map<String, String>> listData1, List<Map<String, String>> listData2, String requestid, List<Map<String, String>> listData4) {
+
+//        this.writeLog("步骤3");
+        Properties logonProperties = new Properties();
+        logonProperties.put("jco.client.ashost", ip); //系统的IP地址
+        logonProperties.put("jco.client.client", client);           //要登录的客户端
+        logonProperties.put("jco.client.sysnr", clientNum);             //系统编号
+        logonProperties.put("jco.client.user", user);         //登录用户名
+        logonProperties.put("jco.client.passwd", password);      //用户登录口令
+//        this.writeLog("步骤4");
+        //返回结果
+        String resultStr;
+        boolean success;
+
+        //用上述条件创建一个连接对象
+        JCO.Client myConnection = JCO.createClient(logonProperties);
+
+        this.writeLog("开始与SAP建立连接");
+        myConnection.connect();       //进行实际连接
+
+//        this.writeLog("开始建立连接3");
+        //如果连接不为null并且处于活动状态
+        if (myConnection.isAlive()) {
+//            this.writeLog("开始建立连接4");
+            //从连接获得一个逻辑意义上的“仓库”对象（Repository）
+            JCO.Repository myRepository =
+                    new JCO.Repository("Repository",  //只是一个名字
+                            myConnection); //活动的连接
+            //要调用的SAP函数名称
+            String strFunc = "ZRFC_SD_FBSJ_SUMMATION";
+            //从“仓库”中获得一个指定函数名的函数模板
+            IFunctionTemplate ft = myRepository.getFunctionTemplate(strFunc.toUpperCase());
+            //从这个函数模板获得该SAP函数的对象
+            JCO.Function function = ft.getFunction();
+
+            //用参数名获得MARA内部表对象
+            JCO.Table ITPO = function.getTableParameterList().getTable("IT_DATA");
+            String KUNNR = mainTable.get("KUNNR");
+            String nodeId = mainTable.get("nodeId");
+            String AUART = mainTable.get("AUART");
+            RecordSet rs = new RecordSet();
+            String VBELN = "";
+            rs.execute("select VBELN from " + mainTableName + " where  requestid='" + requestid + "'");
+            if (rs.next()) {
+                VBELN = rs.getString("VBELN");
+            }
+            //归档节点状态传B，提交及其他节点传A
+            String ZFLAG = "A";
+            String localNodeId;
+            //赠补
+            if (AUART.equals("ZFD2")) {
+                localNodeId = Prop.getPropValue("siwode", "zbnodeId");
+            } else {
+                localNodeId = Prop.getPropValue("siwode", "nodeId");
+            }
+            if (localNodeId.contains(nodeId)) {
+                ZFLAG = "B";
+            }
+            for (int i = 0; i < listData1.size(); i++) {
+                Map<String, String> map = listData1.get(i);
+                //存在编号为空的情况，在这里做特殊处理
+                if (map.size() == 0) {
+                    continue;
+                }
+                //新增一条空行
+                ITPO.appendRow();
+                //定位到第0行
+                ITPO.setRow(i);
+                //流程主表数据
+                ITPO.setValue(KUNNR, "KUNNR");//客户编号
+                ITPO.setValue(VBELN, "VBELN");//分班单号
+                //流程明细数据
+                ITPO.setValue(map.get("MATNR"), "MATNR");//款号+尺码
+                ITPO.setValue(map.get("ZSUMMK"), "ZSUMMK");//数量
+                ITPO.setValue(map.get("MAKTX"), "MAKTX");//备注
+                ITPO.setValue(map.get("ZBANJ"), "ZBANJ");//班级
+                ITPO.setValue(ZFLAG, "ZFLAG"); //A: 可覆盖， B：不可修改
+                this.writeLog(listData1.get(i).toString());
+            }//分班明细表传6个字段
+
+            /*for (int i = 0; i < listData4.size(); i++) {
+                Map<String,String> map =  listData1.get(0);
+                Map<String,String> map4 =  listData4.get(i);
+                //存在编号为空的情况，在这里做特殊处理
+                if (map.size() == 0) {
+                    continue;
+                }
+                //新增一条空行
+                ITPO.appendRow();
+                //定位到第0行
+                ITPO.setRow(listData1.size()+i);
+                //流程主表数据
+                ITPO.setValue(KUNNR, "KUNNR");//客户编号
+                ITPO.setValue(VBELN, "VBELN");//分班单号
+                //流程明细数据  //织标传输地方
+                ITPO.setValue(map4.get("zhibiaomianma"), "MATNR");//织标编码
+                ITPO.setValue(map4.get("zbsl"), "ZSUMMK");//数量
+                ITPO.setValue(map.get("MAKTX"), "MAKTX");//备注
+                ITPO.setValue(map.get("ZBANJ"), "ZBANJ");//班级
+                ITPO.setValue(ZFLAG, "ZFLAG"); //A: 可覆盖， B：不可修改
+                this.writeLog(listData4.get(i).toString()+"织标");
+            }*/
+            //打印IPTO
+            this.writeLog("打印ITPO:");
+            this.writeLog(ITPO.toString());
+            //执行函数
+            myConnection.execute(function);
+
+            //在执行函数后可用相同方式获得输出结果
+            JCO.ParameterList outs = function.getExportParameterList();//输出参数和结构处理
+            String EV_MSGTY = (outs.getValue("EV_MSGTY") + "").replace("'", "");
+            String EV_MSGTX = (outs.getValue("EV_MSGTX") + "").replace("'", "");
+
+            String mainId = mainTable.get("mainId");
+            if (EV_MSGTY.equals("E")) {
+                resultStr = "消息类型：" + EV_MSGTY + ";消息信息" + EV_MSGTX;
+                this.writeLog("消息类型：" + EV_MSGTY + ";消息信息" + EV_MSGTX);
+                return resultStr;
+            } else {
+                //2020/05/25注释掉以下出错代码
+                //将归并重新写
+//                //归档不重新计算汇总数据
+//                if (!workflowOver) {
+//                    success = this.doInsertOrderDt3Form(AUART, mainId);
+//                } else {
+//                    success = true;
+//                }
+                //为什么这里要赋值为true而不是直接删除呢，因为不为true后面直接返给前端SAP调用失败？？？？？？？？这都哪跟哪的提示。
+                //至于为什么后面不直接调用其他方法而要判断if(success) 因为我不想改别人的代码 怕出问题。
+                success = true;
+            }
+            this.writeLog("开始建立连接5");
+
+        } else {
+            resultStr = "F";
+            this.writeLog("调用SAP接口失败！");
+            return resultStr;
+        }
+        //断开连接
+        myConnection.disconnect();
+        this.writeLog("与SAP断开连接");
+        this.writeLog("开始建立连接6");
+        if (success) {
+            resultStr = doPushOrderDt2ToSap(mainTable, listData1, listData2, requestid, listData4);
+        } else {
+            resultStr = "F";
+            this.writeLog("调用SAP接口失败！");
+            return resultStr;
+        }
+        return resultStr;
+    }
+
+    public String doPushOrderDt2ToSap(Map<String, String> mainTable, List<Map<String, String>> listData1, List<Map<String, String>> listData2, String requestid, List<Map<String, String>> listData4) {
+        Properties logonProperties = new Properties();
+        logonProperties.put("jco.client.ashost", ip); //系统的IP地址
+        logonProperties.put("jco.client.client", client);           //要登录的客户端
+        logonProperties.put("jco.client.sysnr", clientNum);             //系统编号
+        logonProperties.put("jco.client.user", user);         //登录用户名
+        logonProperties.put("jco.client.passwd", password);      //用户登录口令
+        //返回结果
+        String resultStr;
+        init();
+        //用上述条件创建一个连接对象
+        JCO.Client myConnection = JCO.createClient(logonProperties);
+        this.writeLog("开始与SAP建立连接");
+        myConnection.connect();       //进行实际连接
+        //如果连接不为null并且处于活动状态
+        if (myConnection.isAlive()) {
+            //从连接获得一个逻辑意义上的“仓库”对象（Repository）
+            JCO.Repository myRepository =
+                    new JCO.Repository("Repository",  //只是一个名字
+                            myConnection); //活动的连接
+            //要调用的SAP函数名称
+            String strFunc = "ZRFC_SD_FBSJ_SIZE";
+            //从“仓库”中获得一个指定函数名的函数模板
+            IFunctionTemplate ft = myRepository.getFunctionTemplate(strFunc.toUpperCase());
+            //从这个函数模板获得该SAP函数的对象
+            JCO.Function function = ft.getFunction();
+            //用参数名获得IT_MARA内部表对象
+            JCO.Table MARA = function.getTableParameterList().getTable("IT_SIZE_NORMAL");
+            String nodeId = mainTable.get("nodeId");
+            RecordSet rs = new RecordSet();
+            String VBELN = "";
+            rs.execute("select VBELN from " + mainTableName + " where  requestid='" + requestid + "'");
+            if (rs.next()) {
+                VBELN = rs.getString("VBELN");
+            }
+            String AUART = mainTable.get("AUART");
+            //订单编号和分班单号一样
+            String BSTKD = VBELN;
+            String sqrq = mainTable.get("sqrq").replace("-", "");
+            //归档节点状态传B，提交及其他节点传A
+            String ZFLAG = "A";
+            String localNodeId = "";
+            //赠补
+            if (AUART.equals("ZFD2")) {
+                localNodeId = Prop.getPropValue("siwode", "zbnodeId");
+            } else {
+                localNodeId = Prop.getPropValue("siwode", "nodeId");
+            }
+            if (localNodeId.contains(nodeId)) {
+                ZFLAG = "B";
+            }
+            for (int i = 0; i < listData1.size(); i++) {
+                //新增一条空行
+                MARA.appendRow();
+                //定位到第0行
+                MARA.setRow(i);
+                Map<String, String> map = listData1.get(i);
+                //存在编号为空的情况，在这里做特殊处理
+                if (map.size() == 0) {
+                    continue;
+                }
+                String exist = map.get("exist");
+                //取汇总后的明细行
+                if (exist.equals("true")) {
+                    continue;
+                }
+                //设定该行对应变量
+                MARA.setValue(sellerName, "CRNAM");
+                MARA.setValue(mainTable.get("KUNNR"), "KUNNR");//客户编号
+                MARA.setValue(VBELN, "VBELN");//分班单号
+                MARA.setValue(ZFLAG, "ZFLAG");//是否可更改标示。审核通过后传B 未审核通过传A
+                MARA.setValue(mainTable.get("VKORG"), "VKORG");//销售组织
+                MARA.setValue(mainTable.get("VTWEG"), "VTWEG");//分销渠道
+                MARA.setValue(mainTable.get("SPART"), "SPART");//产品组
+                MARA.setValue(mainTable.get("KVGR1"), "KVGR1");//货期
+                MARA.setValue(mainTable.get("KVGR2"), "KVGR2");//打包要求
+                MARA.setValue(mainTable.get("KVGR3"), "KVGR3");//印花
+                MARA.setValue(mainTable.get("AUART"), "AUART");//订单类型
+                MARA.setValue(BSTKD, "BSTKD");//订单号  跟分班单号一样
+                MARA.setValue(mainTable.get("AUGRU"), "AUGRU");//订单原因
+                MARA.setValue(mainTable.get("MVGR1"), "MVGR1");//学段   //废弃？自行判断
+                MARA.setValue(mainTable.get("MVGR2"), "MVGR2");//组合
+                MARA.setValue(mainTable.get("WERKS"), "WERKS");//工厂
+                MARA.setValue(map.get("MATNR"), "MATNR");//款号
+                //2022.03.03 根据需求增加下面3个字段
+                MARA.setValue(mainTable.get("SUBMI"), "SUBMI");//收获联系人
+                MARA.setValue(mainTable.get("TELF1"), "TELF1");//收获人电话
+                MARA.setValue(mainTable.get("BNAME"), "BNAME");//收获地址
+                //这里传累加的数量字段
+                MARA.setValue(map.get("ljZSUMMK"), "ZSUMMC");//汇总表里的累加字段
+                MARA.setValue(map.get("MVGR1"), "MVGR1");//学段
+                //归档日期
+                SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMdd");
+                String sdf1 = sdf.format(new Date());//时间
+                MARA.setValue(sdf1, "UPDAT");
+                //新增织标总数字段
+                MARA.setValue(mainTable.get("ZMENGE"), "ZMENGE");
+            }
+            this.writeLog("MARA表格信息：");
+            this.writeLog(MARA.toString());
+
+            //用参数名获得IT_AUSP内部表对象
+            JCO.Table AUSP = function.getTableParameterList().getTable("IT_SIZE_SPECIAL");
+            for (int i = 0; i < listData2.size(); i++) {
+                Map<String, String> map = listData2.get(i);
+                //新增一条空行
+                AUSP.appendRow();
+                //定位到第0行
+                AUSP.setRow(i);
+                AUSP.setValue(map.get("MATNRN"), "ZNUMBER");//款号
+                AUSP.setValue(VBELN, "VBELN");//分班单号
+                AUSP.setValue(map.get("ZSNAME"), "ZSNAME");//姓名
+                AUSP.setValue(sexMap.get(map.get("ZSEX")), "ZSEX");//性别
+                AUSP.setValue(map.get("ZCLASS"), "ZCLASS");//班级
+                AUSP.setValue(map.get("ZHIGH"), "ZHIGH");//身高
+                AUSP.setValue(map.get("ZCHEST"), "ZCHEST");//胸围
+                AUSP.setValue(map.get("ZWAIST"), "ZWAIST");//腰围
+                AUSP.setValue(map.get("ZHIP"), "ZHIP");//臀围
+                AUSP.setValue(map.get("ZAMOUNT"), "ZAMOUNT");//校服数量
+                AUSP.setValue(map.get("ZREMARK"), "ZREMARK");//尺码
+                AUSP.setValue(ZFLAG, "ZFLAG");//状态 A 或者 B
+                AUSP.setValue(map.get("ZGRADE"), "ZGRADE");//年纪
+                this.writeLog(listData2.get(i).toString());
+            }
+            /*for (int i = 0; i < listData4.size() ; i++) {
+                //新增一条空行
+                MARA.appendRow();
+                //定位到第0行
+                MARA.setRow(listData1.size()+i);
+                Map<String,String> map =  listData1.get(0);
+                Map<String,String> map4 =  listData4.get(i);
+                //存在编号为空的情况，在这里做特殊处理
+                if (map.size() == 0) {
+                    continue;
+                }
+                String exist = map.get("exist");
+                //取汇总后的明细行
+                if (exist.equals("true")) {
+                    continue;
+                }
+                //设定该行对应变量
+                MARA.setValue(sellerName, "CRNAM");
+                MARA.setValue(mainTable.get("KUNNR"), "KUNNR");//客户编号
+                MARA.setValue(VBELN, "VBELN");//分班单号
+                MARA.setValue(ZFLAG, "ZFLAG");//是否可更改标示。审核通过后传B 未审核通过传A
+                MARA.setValue(mainTable.get("VKORG"), "VKORG");//销售组织
+                MARA.setValue(mainTable.get("VTWEG"), "VTWEG");//分销渠道
+                MARA.setValue(mainTable.get("SPART"), "SPART");//产品组
+                MARA.setValue(mainTable.get("KVGR1"), "KVGR1");//货期
+                MARA.setValue(mainTable.get("KVGR2"), "KVGR2");//打包要求
+                MARA.setValue(mainTable.get("KVGR3"), "KVGR3");//印花
+                MARA.setValue(mainTable.get("AUART"), "AUART");//订单类型
+                MARA.setValue(BSTKD, "BSTKD");//订单号  跟分班单号一样
+                MARA.setValue(mainTable.get("AUGRU"), "AUGRU");//订单原因
+                MARA.setValue(mainTable.get("MVGR1"), "MVGR1");//学段   //废弃？自行判断
+                MARA.setValue(mainTable.get("MVGR2"), "MVGR2");//组合
+                MARA.setValue(mainTable.get("WERKS"), "WERKS");//工厂
+                *//*MARA.setValue(map4.get("zhibiaomianma"), "MATNR");//款号
+                //这里传累加的数量字段 //织标传输地方
+                MARA.setValue(map4.get("zbsl"), "ZSUMMC");//织标数量*//*
+                MARA.setValue(map.get("MVGR1"), "MVGR1");//学段
+                //归档日期
+                SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMdd");
+                String sdf1 = sdf.format(new Date());//时间
+                MARA.setValue(sdf1, "UPDAT");
+                this.writeLog(listData1.get(i).toString());
+            }*/
+            //执行函数
+            myConnection.execute(function);
+            //在执行函数后可用相同方式获得输出结果
+            JCO.ParameterList outs = function.getExportParameterList();//输出参数和结构处理
+            String EV_MSGTY = (outs.getValue("EV_MSGTY") + "").replace("", "").replace("'", "");
+            String EV_MSGTX = (outs.getValue("EV_MSGTX") + "").replace("", "").replace("'", "");
+            this.writeLog("消息类型：" + EV_MSGTY + ";消息信息" + EV_MSGTY);
+            if (EV_MSGTY.equals("E")) {
+                resultStr = "消息类型：" + EV_MSGTY + ";消息信息" + EV_MSGTX;
+            } else {
+                resultStr = EV_MSGTY;
+            }
+        } else {
+            resultStr = "F";
+            this.writeLog("调用SAP接口失败！");
+        }
+        //断开连接
+        myConnection.disconnect();
+        this.writeLog("与SAP连接结束！");
+        return resultStr;
+    }
+
+    //明细表汇总
+    public boolean doInsertOrderDt3Form(String AUART, String mainid) {
+        String dt;
+        String dt1;
+        String dt3 = "";
+        //赠补
+        if (AUART.equals("ZFD2")) {
+            dt = "formtable_main_369";
+            dt1 = "formtable_main_369_dt1";
+            dt3 = "formtable_main_369_dt3";
+        } else {
+            dt = "formtable_main_339";
+            dt1 = "formtable_main_339_dt1";
+            dt3 = "formtable_main_339_dt3";
+        }
+        boolean success = false;
+        RecordSet rs = new RecordSet();
+        long cnt = 0L;
+        rs.execute("select COUNT(1) as cnt  from " + dt3 + " where mainid = " + mainid + "");
+        if (rs.next()) {
+            cnt = Long.parseLong(rs.getString("cnt"));
+        }
+        if (cnt != 0) {
+            rs.executeUpdate("delete from " + dt3 + " where mainid = " + mainid + "");
+        }
+        this.writeLog("开始查询汇总表");
+        rs.execute("select a.MATNR,a.MVGR1,b.lsj,a.ps,a.xh105,a.xh115,a.xh125,a.xh135,a.xh145,a.xh155,a.xh165,a.xh175,a.xh185,a.xh195,a.xh205,a.th999,a.hj from \n" +
+                "(\n" +
+                "select t.MATNR,t.MVGR1,\n" +
+                "sum(t.ps)ps,\n" +
+                "sum(t.xh105)xh105,\n" +
+                "sum(t.xh115)xh115,\n" +
+                "sum(t.xh125)xh125,\n" +
+                "sum(t.xh135)xh135,\n" +
+                "sum(t.xh145)xh145,\n" +
+                "sum(t.xh155)xh155,\n" +
+                "sum(t.xh165)xh165,\n" +
+                "sum(t.xh175)xh175,\n" +
+                "sum(t.xh185)xh185,\n" +
+                "sum(t.xh195)xh195,\n" +
+                "sum(t.xh205)xh205,\n" +
+                "sum(t.th)th999,\n" +
+                "sum((case when t.ps is null then 0 else t.ps end)\n" +
+                "+(case when t.xh105 is null then 0 else t.xh105 end)\n" +
+                "+(case when t.xh115 is null then 0 else t.xh115 end)\n" +
+                "+(case when t.xh125 is null then 0 else t.xh125 end)\n" +
+                "+(case when t.xh135 is null then 0 else t.xh135 end)\n" +
+                "+(case when t.xh145 is null then 0 else t.xh145 end)\n" +
+                "+(case when t.xh155 is null then 0 else t.xh155 end)\n" +
+                "+(case when t.xh165 is null then 0 else t.xh165 end)\n" +
+                "+(case when t.xh175 is null then 0 else t.xh175 end)\n" +
+                "+(case when t.xh185 is null then 0 else t.xh185 end)\n" +
+                "+(case when t.xh195 is null then 0 else t.xh195 end)\n" +
+                "+(case when t.xh205 is null then 0 else t.xh205 end)\n" +
+                "+(case when t.th is null then 0 else t.th end))hj\n" +
+                " from " + dt + " t1 \n" +
+                " left join  " + dt1 + " t on t1.id=t.mainid\n" +
+                " where t1.id='" + mainid + "'\n" +
+                " group by t.MATNR,t.MVGR1)a\n" +
+                " left join \n" +
+                " (select t.MATNR,t.MVGR1,t.lsj \n" +
+                " from " + dt1 + " t where t.MATNR<>'' and t.lsj <>''  and t.lsj is not null and t.mainid='" + mainid + "'\n" +
+                " group by t.MATNR,t.MVGR1,t.lsj)b\n" +
+                " on a.MATNR=b.MATNR\n" +
+                " and a.MVGR1 = b.MVGR1");
+        while (rs.next()) {
+            String kh = rs.getString("MATNR");
+            String xd = rs.getString("MVGR1");
+            String ps = rs.getString("ps");
+            String xh105 = rs.getString("xh105");
+            String xh115 = rs.getString("xh115");
+            String xh125 = rs.getString("xh125");
+            String xh135 = rs.getString("xh135");
+            String xh145 = rs.getString("xh145");
+            String xh155 = rs.getString("xh155");
+            String xh165 = rs.getString("xh165");
+            String xh175 = rs.getString("xh175");
+            String xh185 = rs.getString("xh185");
+            String xh195 = rs.getString("xh195");
+            String xh205 = rs.getString("xh205");
+            String th999 = rs.getString("th999");
+            String lsj = rs.getString("lsj");
+            String hj = rs.getString("hj");
+
+            String sql = "insert into " + dt3 + " (mainid,MATNRN,MVGR1N,psn,xh105n," +
+                    "xh115n,xh125n,xh135n,xh145n,xh155n,xh165n,xh175n,xh185n,xh195n,xh205n,xh999n,zjn,lsj)" +
+                    " values(" + mainid + ",'" + kh + "','" + xd + "','" + ps + "','" + xh105 + "'" +
+                    ",'" + xh115 + "'" +
+                    ",'" + xh125 + "'" +
+                    ",'" + xh135 + "'" +
+                    ",'" + xh145 + "'" +
+                    ",'" + xh155 + "'" +
+                    ",'" + xh165 + "'" +
+                    ",'" + xh175 + "'" +
+                    ",'" + xh185 + "'" +
+                    ",'" + xh195 + "'" +
+                    ",'" + xh205 + "'" +
+                    ",'" + th999 + "'" +
+                    ",'" + hj + "'" +
+                    ",'" + lsj + "'" +
+                    ")";
+            writeLog("插入SAP汇总sql，sql=" + sql);
+            success = rs.executeUpdate(sql);
+            writeLog("插入SAP汇总明细，result=" + success);
+            if (!success) {
+                this.writeLog("汇总数据入库失败！");
+                return success;
+            }
+        }
+        return success;
+    }
+
+    public String GradeZH(String grade) {
+        switch (grade) {
+            case "0":
+                return "小班";
+            case "1":
+                return "中班";
+            case "2":
+                return "大班";
+            case "3":
+                return "学前班";
+            case "4":
+                return "幼儿园全校";
+            case "5":
+                return "一年级";
+            case "6":
+                return "二年级";
+            case "7":
+                return "三年级";
+            case "8":
+                return "四年级";
+            case "9":
+                return "五年级";
+            case "10":
+                return "六年级";
+            case "11":
+                return "小学全校";
+            case "12":
+                return "七年级";
+            case "13":
+                return "八年级";
+            case "14":
+                return "九年级";
+            case "15":
+                return "高一";
+            case "16":
+                return "高二";
+            case "17":
+                return "高三";
+            case "18":
+                return "中学全校";
+        }
+        return grade;
+    }
+}
